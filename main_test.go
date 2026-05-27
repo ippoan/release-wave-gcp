@@ -312,6 +312,79 @@ func TestLiveCloudRunFlipTraffic_HTTPError(t *testing.T) {
 	}
 }
 
+type errTokenSource struct{}
+
+func (errTokenSource) Token() (*oauth2.Token, error) {
+	return nil, errors.New("token source boom")
+}
+
+func TestLiveCloudRunFlipTraffic_TokenError(t *testing.T) {
+	gcp := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	defer gcp.Close()
+	cr := &liveCloudRun{
+		httpClient: &http.Client{},
+		tokenSrc:   errTokenSource{},
+		endpoint:   gcp.URL,
+	}
+	_, err := cr.FlipTraffic(context.Background(),
+		"projects/p/locations/r/services/s", "tag")
+	if err == nil {
+		t.Fatalf("expected token error")
+	}
+	if !strings.Contains(err.Error(), "get token") {
+		t.Fatalf("err should mention 'get token': %v", err)
+	}
+}
+
+func TestLiveCloudRunFlipTraffic_LongErrorBodyTrimmed(t *testing.T) {
+	// 1KB を超える upstream body は 1KB に切られて返ること
+	bigBody := strings.Repeat("X", 2048)
+	gcp := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(bigBody))
+	}))
+	defer gcp.Close()
+
+	cr := newTestLiveCloudRun(gcp.URL)
+	_, err := cr.FlipTraffic(context.Background(),
+		"projects/p/locations/r/services/s", "tag")
+	if err == nil {
+		t.Fatalf("expected error")
+	}
+	msg := err.Error()
+	// err 文字列に含まれる body 部分は 1KB に切られているはず。
+	// (err 全体は "cloud run patch returned 400: " 等の prefix が付くので長め)
+	// 末尾の連続 X の数を数える。
+	xCount := 0
+	for i := len(msg) - 1; i >= 0 && msg[i] == 'X'; i-- {
+		xCount++
+	}
+	if xCount > 1024 {
+		t.Fatalf("body should be trimmed to 1024 X but got %d", xCount)
+	}
+	if xCount < 100 {
+		t.Fatalf("body should contain body content but only got %d X", xCount)
+	}
+}
+
+func TestLiveCloudRunFlipTraffic_InvalidURL(t *testing.T) {
+	// http.NewRequestWithContext が url.Parse で fail する endpoint を与える。
+	// scheme 無しの control character で parse error が出る。
+	cr := &liveCloudRun{
+		httpClient: &http.Client{},
+		tokenSrc:   &staticTokenSource{tok: "t"},
+		endpoint:   "http://control\x7fchar",
+	}
+	_, err := cr.FlipTraffic(context.Background(),
+		"projects/p/locations/r/services/s", "tag")
+	if err == nil {
+		t.Fatalf("expected error")
+	}
+	if !strings.Contains(err.Error(), "build request") {
+		t.Fatalf("err should mention 'build request': %v", err)
+	}
+}
+
 func TestLiveCloudRunFlipTraffic_BadJSONResponse(t *testing.T) {
 	gcp := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`<not json>`))
