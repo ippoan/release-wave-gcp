@@ -1,0 +1,21 @@
+# coverage_100.toml
+#
+# `go-ci.yml` の coverage 100% gate が読む。登録された file の function は
+# 全部 100% カバレッジを維持すること。exclude_funcs に列挙した function は
+# 要求から除外。1 つでも違反すると CI fail (warning ではない)。
+#
+# staging = 実運用環境 (= 本番) の運用前提なので、CI green = 100% カバー
+# 維持を強制する。
+#
+# Refs ippoan/ci-dashboard#137
+
+[main.go]
+# main()        - HTTP server bootstrap。実行すると ListenAndServe で block するため test 不可。
+# mustEnv()     - log.Fatal を含む env validation。本体はテスト分離した newMuxWith に出してある。
+exclude_funcs = ["main", "mustEnv"]
+
+[cloudrun.go]
+# newLiveCloudRun() - google.DefaultTokenSource を呼ぶ ADC 初期化。test 環境では ADC が無いため
+#                     exercise 不可。実際の token を扱う FlipTraffic は staticTokenSource で 100%
+#                     カバー済み。
+exclude_funcs = ["newLiveCloudRun"]
