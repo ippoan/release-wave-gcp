@@ -30,6 +30,8 @@ Release Wave 機構の **GCP 側 executor**。CF Worker からは GCP SA key を
 |---|---|---|---|
 | GET | `/health` | 不要 | Cloud Run liveness 用 |
 | POST | `/cloudrun/flip-traffic` | `X-Release-Wave-API-Key` 必須 | service の traffic を `to_revision_tag` が指す revision に 100% flip |
+| POST | `/cloudrun/rollback` | 同上 | service の traffic を `to_revision` (revision name) に 100% 戻す |
+| POST | `/cloudrun/stage-check` | 同上 | service の現状 (latest ready revision / terminal condition / traffic) を返す |
 
 ### `POST /cloudrun/flip-traffic`
 
@@ -54,6 +56,57 @@ response (200):
 - 戻り値は GCP の long-running operation の resource name。caller は必要に応じて poll する (本 proxy は待たない)
 - `project` / `region` / `service` に `/` `?` `#` を含むとリクエスト全体を 400 で reject (URL inject 防止)
 - upstream エラーは 502 で固定文言を返す。詳細は service log にのみ出力 (値漏れ防止)
+
+### `POST /cloudrun/rollback`
+
+request:
+
+```json
+{
+  "project": "cloudsql-sv",
+  "region": "asia-northeast1",
+  "service": "rust-alc-api",
+  "to_revision": "rust-alc-api-00041-zzz"
+}
+```
+
+response (200): flip-traffic と同形式。
+
+- 内部は flip-traffic と同じ PATCH (`updateMask=traffic`) だが、`Tag` ではなく `Revision` (full or short revision name) で参照する
+- caller (ci-dashboard DO) は flip 前の latest revision を記録しておき、ここに渡す
+- DB が contract migration 後の状態だと旧 code が動かないので、rollback 安全性は caller 側 (issue #137 の `rollback.safe` flag) で別途判定する
+
+### `POST /cloudrun/stage-check`
+
+request:
+
+```json
+{
+  "project": "cloudsql-sv",
+  "region": "asia-northeast1",
+  "service": "rust-alc-api"
+}
+```
+
+response (200):
+
+```json
+{
+  "ok": true,
+  "status": {
+    "name": "projects/.../services/rust-alc-api",
+    "latest_ready_revision": "rust-alc-api-00042-abc",
+    "latest_created_revision": "rust-alc-api-00042-abc",
+    "traffic": [{ "type": "TRAFFIC_TARGET_ALLOCATION_TYPE_REVISION", "revision": "...", "percent": 100 }],
+    "terminal_condition": { "type": "Ready", "state": "CONDITION_SUCCEEDED" },
+    "ready": true
+  }
+}
+```
+
+- 内部的に `GET https://run.googleapis.com/v2/projects/{p}/locations/{r}/services/{s}` を叩く
+- `ready` は `terminalCondition.type == "Ready"` かつ `state == "CONDITION_SUCCEEDED"` のときだけ true (= 派生 boolean)
+- ci-dashboard DO の `alarm()` が stage barrier の poll に使う用途
 
 ## 設計上の意図
 
@@ -93,11 +146,7 @@ gcloud auth application-default login
 RELEASE_WAVE_API_KEY=dev-key ./release-wave-gcp
 ```
 
-## 今後追加予定の endpoint
+## 次フェーズ
 
-[ippoan/ci-dashboard#137](https://github.com/ippoan/ci-dashboard/issues/137) で計画されている残り 2 endpoint:
-
-- `POST /cloudrun/stage-check` — revision の Ready status を返す
-- `POST /cloudrun/rollback` — 旧 revision に traffic を 100% 戻す
-
-本 MVP では `/cloudrun/flip-traffic` 1 本だけ。stage-check / rollback は実運用フローの中で必要になった時点で追加する。
+- Cloud Run deploy job を CI に組み込み (= GCP setup 完了後、`ippoan/ci-workflows/cloud-run-deploy.yml` 経由)
+- ci-dashboard DO `ReleaseWave` + MCP tools (issue #137 Phase 3) からの実呼び出し試験
