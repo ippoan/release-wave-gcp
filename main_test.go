@@ -172,7 +172,7 @@ func TestFlipTraffic_MissingFields(t *testing.T) {
 		{"missing project", `{"region":"r","service":"s","to_revision_tag":"t"}`},
 		{"missing region", `{"project":"p","service":"s","to_revision_tag":"t"}`},
 		{"missing service", `{"project":"p","region":"r","to_revision_tag":"t"}`},
-		{"missing to_revision_tag", `{"project":"p","region":"r","service":"s"}`},
+		{"missing both flip targets", `{"project":"p","region":"r","service":"s"}`},
 		{"empty project", `{"project":"  ","region":"r","service":"s","to_revision_tag":"t"}`},
 	}
 	for _, tc := range cases {
@@ -233,6 +233,49 @@ func TestFlipTraffic_UpstreamError(t *testing.T) {
 	}
 	if strings.Contains(readBody(t, resp), "upstream boom") {
 		t.Fatalf("upstream error leaked into response")
+	}
+}
+
+func TestFlipTraffic_RevisionHappyPath(t *testing.T) {
+	// to_revision 指定の単独 flip。内部では Rollback method (= revision を 100%)
+	// を流用するため fakeCloudRun.Rollback が呼ばれ、FlipTraffic は呼ばれない。
+	fake := &fakeCloudRun{rollbackReturnOp: "projects/p/locations/r/operations/flip-rev-1"}
+	srv := newTestServer(fake)
+	defer srv.Close()
+	body := `{"project":"cloudsql-sv","region":"asia-northeast1","service":"rust-alc-api","to_revision":"rust-alc-api-00042-abc"}`
+	resp := do(t, srv, http.MethodPost, "/cloudrun/flip-traffic", authHeader(), body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, body=%s", resp.StatusCode, readBody(t, resp))
+	}
+
+	var got trafficResponse
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !got.Ok || got.Operation != "projects/p/locations/r/operations/flip-rev-1" {
+		t.Fatalf("response: %+v", got)
+	}
+	if fake.rollbackCalls != 1 || fake.flipCalls != 0 {
+		t.Fatalf("expected Rollback to be used for revision flip: flipCalls=%d rollbackCalls=%d",
+			fake.flipCalls, fake.rollbackCalls)
+	}
+	wantFull := "projects/cloudsql-sv/locations/asia-northeast1/services/rust-alc-api"
+	if fake.rollbackCalledWith.fullServiceName != wantFull {
+		t.Fatalf("fullServiceName: got %s", fake.rollbackCalledWith.fullServiceName)
+	}
+	if fake.rollbackCalledWith.toRevision != "rust-alc-api-00042-abc" {
+		t.Fatalf("toRevision: got %s", fake.rollbackCalledWith.toRevision)
+	}
+}
+
+func TestFlipTraffic_BothTargets(t *testing.T) {
+	// to_revision_tag と to_revision の両方指定は曖昧なので 400。
+	srv := newTestServer(&fakeCloudRun{})
+	defer srv.Close()
+	body := `{"project":"p","region":"r","service":"s","to_revision_tag":"pending-x","to_revision":"rev-1"}`
+	resp := do(t, srv, http.MethodPost, "/cloudrun/flip-traffic", authHeader(), body)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status: got %d, body=%s", resp.StatusCode, readBody(t, resp))
 	}
 }
 

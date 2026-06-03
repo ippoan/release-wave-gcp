@@ -22,11 +22,19 @@ import (
 const defaultCloudRunEndpoint = "https://run.googleapis.com"
 
 // 共通 request: project / region / service の 3 path segment + endpoint 固有 field。
+//
+// flip 先は ToRevisionTag (tag 参照) と ToRevision (revision 名参照) の
+// どちらか一方で指定する (両方/両空は 400):
+//   - ToRevisionTag: wave flip。release-wave-handler が
+//     `--no-traffic --tag pending-<tag>` で stage した revision を同 tag で 100%。
+//   - ToRevision: 単独 flip (wave 非依存)。任意の既存 revision を即 100%。
+//     ci-dashboard の backend-flip 経路 (= backend-rollback の対称) が使う。
 type flipTrafficRequest struct {
 	Project       string `json:"project"`
 	Region        string `json:"region"`
 	Service       string `json:"service"`
 	ToRevisionTag string `json:"to_revision_tag"`
+	ToRevision    string `json:"to_revision"`
 }
 
 type rollbackRequest struct {
@@ -141,8 +149,11 @@ func fullServiceName(project, region, service string) string {
 }
 
 // handleFlipTraffic は POST /cloudrun/flip-traffic の handler。
-// body: { project, region, service, to_revision_tag }
-// → Cloud Run service の traffic を to_revision_tag が指す revision に 100% flip。
+// body: { project, region, service, (to_revision_tag | to_revision) }
+// → Cloud Run service の traffic を指定 revision に 100% flip。
+//
+// flip 先は to_revision_tag (tag 参照) か to_revision (revision 名参照) の
+// どちらか一方で指定する。両方指定 / 両方空は 400。
 func handleFlipTraffic(client cloudRunClient) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -158,14 +169,26 @@ func handleFlipTraffic(client cloudRunClient) http.Handler {
 			writeJSONError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		if strings.TrimSpace(req.ToRevisionTag) == "" {
-			writeJSONError(w, http.StatusBadRequest, "to_revision_tag is required")
+
+		hasTag := strings.TrimSpace(req.ToRevisionTag) != ""
+		hasRev := strings.TrimSpace(req.ToRevision) != ""
+		if hasTag == hasRev {
+			writeJSONError(w, http.StatusBadRequest,
+				"exactly one of to_revision_tag or to_revision is required")
 			return
 		}
 
-		opName, err := client.FlipTraffic(r.Context(),
-			fullServiceName(req.Project, req.Region, req.Service),
-			req.ToRevisionTag)
+		name := fullServiceName(req.Project, req.Region, req.Service)
+		var opName string
+		var err error
+		if hasTag {
+			opName, err = client.FlipTraffic(r.Context(), name, req.ToRevisionTag)
+		} else {
+			// revision 名指定の flip は「指定 revision を 100%」= Rollback method と
+			// 同一の traffic 操作なので流用する (endpoint 上は flip だが、内部的には
+			// revision を 100% に振るだけ。tag stage を伴わない単独 flip 用)。
+			opName, err = client.Rollback(r.Context(), name, req.ToRevision)
+		}
 		if err != nil {
 			log.Printf("flip-traffic upstream error: %v", err)
 			writeJSONError(w, http.StatusBadGateway, "cloud run upstream error")

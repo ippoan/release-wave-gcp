@@ -29,13 +29,20 @@ Release Wave 機構の **GCP 側 executor**。CF Worker からは GCP SA key を
 | method | path | 認証 | 説明 |
 |---|---|---|---|
 | GET | `/health` | 不要 | Cloud Run liveness 用 |
-| POST | `/cloudrun/flip-traffic` | `X-Release-Wave-API-Key` 必須 | service の traffic を `to_revision_tag` が指す revision に 100% flip |
+| POST | `/cloudrun/flip-traffic` | `X-Release-Wave-API-Key` 必須 | service の traffic を `to_revision_tag` (tag) または `to_revision` (revision 名) が指す revision に 100% flip |
 | POST | `/cloudrun/rollback` | 同上 | service の traffic を `to_revision` (revision name) に 100% 戻す |
 | POST | `/cloudrun/stage-check` | 同上 | service の現状 (latest ready revision / terminal condition / traffic) を返す |
 
 ### `POST /cloudrun/flip-traffic`
 
-request:
+flip 先は `to_revision_tag` (tag 参照) か `to_revision` (revision 名参照) の **どちらか一方**で指定する。両方指定 / 両方空は 400。
+
+| mode | field | 用途 |
+|---|---|---|
+| tag flip | `to_revision_tag` | **wave flip**。release-wave-handler が `--no-traffic --tag pending-<tag>` で stage した revision を同 tag で 100% にする (stage と対称) |
+| revision flip | `to_revision` | **単独 flip** (wave 非依存)。任意の既存 revision を即 100% にする。ci-dashboard の backend-flip 経路 (= backend-rollback の対称) が使う |
+
+request (tag flip):
 
 ```json
 {
@@ -46,13 +53,24 @@ request:
 }
 ```
 
+request (revision flip = 単独 flip):
+
+```json
+{
+  "project": "cloudsql-sv",
+  "region": "asia-northeast1",
+  "service": "rust-alc-api",
+  "to_revision": "rust-alc-api-00042-abc"
+}
+```
+
 response (200):
 
 ```json
 { "ok": true, "operation": "projects/.../operations/lro-..." }
 ```
 
-- 内部的に `PATCH https://run.googleapis.com/v2/projects/{p}/locations/{r}/services/{s}?updateMask=traffic` を `traffic: [{ type: REVISION, tag, percent: 100 }]` で叩く
+- 内部的に `PATCH https://run.googleapis.com/v2/projects/{p}/locations/{r}/services/{s}?updateMask=traffic` を `traffic: [{ type: REVISION, (tag|revision), percent: 100 }]` で叩く
 - 戻り値は GCP の long-running operation の resource name。caller は必要に応じて poll する (本 proxy は待たない)
 - `project` / `region` / `service` に `/` `?` `#` を含むとリクエスト全体を 400 で reject (URL inject 防止)
 - upstream エラーは 502 で固定文言を返す。詳細は service log にのみ出力 (値漏れ防止)
