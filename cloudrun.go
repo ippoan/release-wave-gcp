@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
@@ -156,6 +157,15 @@ func (c *liveCloudRun) FlipTraffic(ctx context.Context, fullServiceName string) 
 	revision := svc.LatestReadyRevision
 	if revision == "" {
 		return "", errors.New("service has no latest ready revision to flip to")
+	}
+	// Cloud Run v2 の GET service は latestReadyRevision を full resource name
+	// (projects/.../services/<svc>/revisions/<rev>) で返すが、traffic[].revision
+	// は **短い revision 名** (<svc>-NNNNN-xxx) のみを受け付ける。full path を
+	// そのまま渡すと "Revision target ... invalid. Expected a revision prefixed
+	// with '<svc>-'" で 400 になるため、最後のパスセグメントを取り出す
+	// (Refs ippoan/ci-dashboard#248)。
+	if idx := strings.LastIndex(revision, "/"); idx >= 0 {
+		revision = revision[idx+1:]
 	}
 	return c.updateTraffic(ctx, fullServiceName, []trafficTarget{
 		{
