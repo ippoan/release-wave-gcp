@@ -438,9 +438,11 @@ func TestLiveCloudRunFlipTraffic_Success(t *testing.T) {
 	gcp := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet {
 			// no-traffic deploy 後: 100% on old + 0% で上がった最新 s-00009-new。
-			// flip は latestReadyRevision (= s-00009-new) を anchor にする。
+			// flip は latestReadyRevision を anchor にする。実 Cloud Run v2 は
+			// latestReadyRevision を full resource name で返すので、proxy が短い
+			// revision 名に変換することを検証する (回帰ガード)。
 			_, _ = w.Write([]byte(`{"name":"projects/p/locations/r/services/s",` +
-				`"latestReadyRevision":"s-00009-new",` +
+				`"latestReadyRevision":"projects/p/locations/r/services/s/revisions/s-00009-new",` +
 				`"traffic":[` +
 				`{"type":"TRAFFIC_TARGET_ALLOCATION_TYPE_REVISION","revision":"s-00008-old","percent":100},` +
 				`{"type":"TRAFFIC_TARGET_ALLOCATION_TYPE_REVISION","revision":"s-00009-new","percent":0}` +
