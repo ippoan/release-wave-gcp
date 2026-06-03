@@ -17,7 +17,6 @@ type fakeCloudRun struct {
 	// FlipTraffic
 	flipCalledWith struct {
 		fullServiceName string
-		toRevisionTag   string
 	}
 	flipReturnOp  string
 	flipReturnErr error
@@ -39,10 +38,9 @@ type fakeCloudRun struct {
 	getServiceCalls      int
 }
 
-func (f *fakeCloudRun) FlipTraffic(_ context.Context, fullServiceName, toRevisionTag string) (string, error) {
+func (f *fakeCloudRun) FlipTraffic(_ context.Context, fullServiceName string) (string, error) {
 	f.flipCalls++
 	f.flipCalledWith.fullServiceName = fullServiceName
-	f.flipCalledWith.toRevisionTag = toRevisionTag
 	if f.flipReturnErr != nil {
 		return "", f.flipReturnErr
 	}
@@ -169,11 +167,10 @@ func TestFlipTraffic_MissingFields(t *testing.T) {
 		name string
 		body string
 	}{
-		{"missing project", `{"region":"r","service":"s","to_revision_tag":"t"}`},
-		{"missing region", `{"project":"p","service":"s","to_revision_tag":"t"}`},
-		{"missing service", `{"project":"p","region":"r","to_revision_tag":"t"}`},
-		{"missing to_revision_tag", `{"project":"p","region":"r","service":"s"}`},
-		{"empty project", `{"project":"  ","region":"r","service":"s","to_revision_tag":"t"}`},
+		{"missing project", `{"region":"r","service":"s"}`},
+		{"missing region", `{"project":"p","service":"s"}`},
+		{"missing service", `{"project":"p","region":"r"}`},
+		{"empty project", `{"project":"  ","region":"r","service":"s"}`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -188,7 +185,7 @@ func TestFlipTraffic_MissingFields(t *testing.T) {
 func TestFlipTraffic_PathInjection(t *testing.T) {
 	srv := newTestServer(&fakeCloudRun{})
 	defer srv.Close()
-	body := `{"project":"p","region":"r","service":"s/../evil","to_revision_tag":"t"}`
+	body := `{"project":"p","region":"r","service":"s/../evil"}`
 	resp := do(t, srv, http.MethodPost, "/cloudrun/flip-traffic", authHeader(), body)
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("status: got %d", resp.StatusCode)
@@ -199,7 +196,7 @@ func TestFlipTraffic_HappyPath(t *testing.T) {
 	fake := &fakeCloudRun{flipReturnOp: "projects/p/locations/r/operations/op-123"}
 	srv := newTestServer(fake)
 	defer srv.Close()
-	body := `{"project":"cloudsql-sv","region":"asia-northeast1","service":"rust-alc-api","to_revision_tag":"pending-v1-42-0"}`
+	body := `{"project":"cloudsql-sv","region":"asia-northeast1","service":"rust-alc-api"}`
 	resp := do(t, srv, http.MethodPost, "/cloudrun/flip-traffic", authHeader(), body)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status: got %d, body=%s", resp.StatusCode, readBody(t, resp))
@@ -217,16 +214,13 @@ func TestFlipTraffic_HappyPath(t *testing.T) {
 	if fake.flipCalledWith.fullServiceName != wantFull {
 		t.Fatalf("fullServiceName: got %s want %s", fake.flipCalledWith.fullServiceName, wantFull)
 	}
-	if fake.flipCalledWith.toRevisionTag != "pending-v1-42-0" {
-		t.Fatalf("toRevisionTag: got %s", fake.flipCalledWith.toRevisionTag)
-	}
 }
 
 func TestFlipTraffic_UpstreamError(t *testing.T) {
 	fake := &fakeCloudRun{flipReturnErr: errors.New("upstream boom")}
 	srv := newTestServer(fake)
 	defer srv.Close()
-	body := `{"project":"p","region":"r","service":"s","to_revision_tag":"t"}`
+	body := `{"project":"p","region":"r","service":"s"}`
 	resp := do(t, srv, http.MethodPost, "/cloudrun/flip-traffic", authHeader(), body)
 	if resp.StatusCode != http.StatusBadGateway {
 		t.Fatalf("status: got %d", resp.StatusCode)
@@ -439,15 +433,17 @@ func TestLiveCloudRunFlipTraffic_Success(t *testing.T) {
 		ctype  string
 		body   patchTrafficBody
 	}
-	// FlipTraffic は (1) GET service で tag→revision を解決し (2) PATCH で
-	// 解決した revision に 100% 振る、の 2 段。GCP mock は両方を捌く。
+	// FlipTraffic は (1) GET service で latestReadyRevision を取り (2) PATCH で
+	// その revision に 100% 振る、の 2 段。GCP mock は両方を捌く。
 	gcp := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet {
-			// 現 traffic: 100% on old + 0% tagged pending-v1 → revision s-00009-new。
+			// no-traffic deploy 後: 100% on old + 0% で上がった最新 s-00009-new。
+			// flip は latestReadyRevision (= s-00009-new) を anchor にする。
 			_, _ = w.Write([]byte(`{"name":"projects/p/locations/r/services/s",` +
+				`"latestReadyRevision":"s-00009-new",` +
 				`"traffic":[` +
 				`{"type":"TRAFFIC_TARGET_ALLOCATION_TYPE_REVISION","revision":"s-00008-old","percent":100},` +
-				`{"type":"TRAFFIC_TARGET_ALLOCATION_TYPE_REVISION","revision":"s-00009-new","tag":"pending-v1","percent":0}` +
+				`{"type":"TRAFFIC_TARGET_ALLOCATION_TYPE_REVISION","revision":"s-00009-new","percent":0}` +
 				`]}`))
 			return
 		}
@@ -464,7 +460,7 @@ func TestLiveCloudRunFlipTraffic_Success(t *testing.T) {
 
 	cr := newTestLiveCloudRun(gcp.URL)
 	op, err := cr.FlipTraffic(context.Background(),
-		"projects/p/locations/r/services/s", "pending-v1")
+		"projects/p/locations/r/services/s")
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -500,14 +496,15 @@ func TestLiveCloudRunFlipTraffic_Success(t *testing.T) {
 	}
 }
 
-// tag が現 traffic に無い (deploy が --tag を付けていない等) と revision を解決
-// できず、PATCH を打たずに loud に fail する。
-func TestLiveCloudRunFlipTraffic_TagNotFound(t *testing.T) {
+// service に latestReadyRevision が無い (deploy 未完了等) と flip 対象が定まらず、
+// PATCH を打たずに loud に fail する。
+func TestLiveCloudRunFlipTraffic_NoLatestReadyRevision(t *testing.T) {
 	patched := false
 	gcp := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPatch {
 			patched = true
 		}
+		// latestReadyRevision 不在 (traffic だけはある)。
 		_, _ = w.Write([]byte(`{"name":"projects/p/locations/r/services/s",` +
 			`"traffic":[{"type":"TRAFFIC_TARGET_ALLOCATION_TYPE_REVISION","revision":"s-00008-old","percent":100}]}`))
 	}))
@@ -515,12 +512,12 @@ func TestLiveCloudRunFlipTraffic_TagNotFound(t *testing.T) {
 
 	cr := newTestLiveCloudRun(gcp.URL)
 	_, err := cr.FlipTraffic(context.Background(),
-		"projects/p/locations/r/services/s", "pending-missing")
-	if err == nil || !strings.Contains(err.Error(), "not found") {
-		t.Fatalf("expected tag-not-found error, got: %v", err)
+		"projects/p/locations/r/services/s")
+	if err == nil || !strings.Contains(err.Error(), "no latest ready revision") {
+		t.Fatalf("expected no-latest-ready-revision error, got: %v", err)
 	}
 	if patched {
-		t.Fatalf("must not PATCH traffic when tag cannot be resolved")
+		t.Fatalf("must not PATCH traffic when no latest ready revision")
 	}
 }
 
@@ -533,7 +530,7 @@ func TestLiveCloudRunFlipTraffic_Non2xx(t *testing.T) {
 
 	cr := newTestLiveCloudRun(gcp.URL)
 	_, err := cr.FlipTraffic(context.Background(),
-		"projects/p/locations/r/services/s", "tag")
+		"projects/p/locations/r/services/s")
 	if err == nil {
 		t.Fatalf("expected error")
 	}
@@ -544,11 +541,8 @@ func TestLiveCloudRunFlipTraffic_Non2xx(t *testing.T) {
 
 func TestLiveCloudRunFlipTraffic_EmptyInputs(t *testing.T) {
 	cr := newTestLiveCloudRun("http://unused")
-	if _, err := cr.FlipTraffic(context.Background(), "", "tag"); err == nil {
+	if _, err := cr.FlipTraffic(context.Background(), ""); err == nil {
 		t.Fatalf("expected error for empty service")
-	}
-	if _, err := cr.FlipTraffic(context.Background(), "projects/p/locations/r/services/s", ""); err == nil {
-		t.Fatalf("expected error for empty tag")
 	}
 }
 

@@ -19,9 +19,11 @@ import (
 // (`projects/.../operations/...`)。caller は必要に応じて poll するが、本 proxy
 // では待たない (= fire-and-return)。
 type cloudRunClient interface {
-	// FlipTraffic は service の traffic を toRevisionTag が指す revision に 100% 振る。
-	// release-wave-handler の stage (`--no-traffic --tag pending-...`) と対称。
-	FlipTraffic(ctx context.Context, fullServiceName, toRevisionTag string) (operationName string, err error)
+	// FlipTraffic は service の traffic を「最新の ready revision」(= no-traffic
+	// deploy で上がった、まだ traffic を受けていない revision) に 100% 振る。
+	// rollback が revision 名指定で traffic を変えるのと対称で、揮発しやすい
+	// Cloud Run revision tag (pending-...) には依存しない (Refs ippoan/ci-dashboard#248)。
+	FlipTraffic(ctx context.Context, fullServiceName string) (operationName string, err error)
 	// Rollback は traffic を toRevision (full revision name) に 100% 振る。
 	// flip 後に問題が見つかった時、旧 revision に明示的に戻す用途。
 	Rollback(ctx context.Context, fullServiceName, toRevision string) (operationName string, err error)
@@ -54,7 +56,7 @@ func newLiveCloudRun(ctx context.Context, endpoint string) (*liveCloudRun, error
 // trafficTarget は v2 API の TrafficTarget JSON 構造。
 // PATCH 送信時 type=REVISION なら Revision (full revision name) が必須。
 // Tag は「その target に tag を付与する」用途 (GET 応答では tag→revision の
-// 対応を読むのに使う)。flip は GET で tag→revision を解決してから Revision で送る。
+// 対応を読むのに使う)。flip / rollback は Revision (revision 名) を直接指定する。
 type trafficTarget struct {
 	Type     string `json:"type"`
 	Tag      string `json:"tag,omitempty"`
@@ -132,40 +134,28 @@ func (c *liveCloudRun) updateTraffic(ctx context.Context, fullServiceName string
 	return lro.Name, nil
 }
 
-// FlipTraffic は traffic を tag で参照される revision に 100% 振る。
+// FlipTraffic は traffic を「最新の ready revision」に 100% 振る。
 //
-// Cloud Run v2 の TrafficTarget は type=TRAFFIC_TARGET_ALLOCATION_TYPE_REVISION の
-// とき `revision` (フル revision 名) が必須。`tag` フィールドは「その target に
-// tag を *付与* する」用途で、既存 tag による revision *選択* には使えない
-// (tag だけ指定して type=REVISION にすると Cloud Run が
-// "traffic[0].revision: must be specified if and only if traffic type is
-// TRAFFIC_TARGET_ALLOCATION_TYPE_REVISION" で 400 を返す)。
-// release-wave-handler は `--no-traffic --tag pending-...` で no-traffic revision
-// に tag を付けているので、現 service の traffic[] を GET して tag → revision 名を
-// 解決してから revision 指定で 100% flip する。
-func (c *liveCloudRun) FlipTraffic(ctx context.Context, fullServiceName, toRevisionTag string) (string, error) {
+// no-traffic deploy (= `--no-traffic` で 0% 配置 + 現 live を pin) で上がった
+// revision は、その service の最新 ready revision になる。flip はそれを GET で
+// 取り、revision 名指定で 100% に切り替えるだけ — rollback が revision 名で
+// traffic を戻すのと完全に対称。
+//
+// 以前は deploy が付けた Cloud Run revision tag (pending-<tag>) を GET で
+// 解決していたが、この tag は次の deploy が traffic を全置換するたびに消える
+// (揮発する) ため flip が "tag not found" で落ちていた。最新 ready revision を
+// 直接 anchor にすることで揮発タグ依存を撤廃する (Refs ippoan/ci-dashboard#248)。
+func (c *liveCloudRun) FlipTraffic(ctx context.Context, fullServiceName string) (string, error) {
 	if fullServiceName == "" {
 		return "", errors.New("fullServiceName is empty")
 	}
-	if toRevisionTag == "" {
-		return "", errors.New("toRevisionTag is empty")
-	}
 	svc, err := c.GetService(ctx, fullServiceName)
 	if err != nil {
-		return "", fmt.Errorf("resolve revision tag %q: %w", toRevisionTag, err)
+		return "", fmt.Errorf("get service for flip: %w", err)
 	}
-	revision := ""
-	for _, t := range svc.Traffic {
-		if t.Tag == toRevisionTag && t.Revision != "" {
-			revision = t.Revision
-			break
-		}
-	}
+	revision := svc.LatestReadyRevision
 	if revision == "" {
-		return "", fmt.Errorf(
-			"revision tag %q not found in service traffic (deploy が --tag %s で no-traffic revision を作っているか確認)",
-			toRevisionTag, toRevisionTag,
-		)
+		return "", errors.New("service has no latest ready revision to flip to")
 	}
 	return c.updateTraffic(ctx, fullServiceName, []trafficTarget{
 		{

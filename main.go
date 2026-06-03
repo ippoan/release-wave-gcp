@@ -23,10 +23,9 @@ const defaultCloudRunEndpoint = "https://run.googleapis.com"
 
 // 共通 request: project / region / service の 3 path segment + endpoint 固有 field。
 type flipTrafficRequest struct {
-	Project       string `json:"project"`
-	Region        string `json:"region"`
-	Service       string `json:"service"`
-	ToRevisionTag string `json:"to_revision_tag"`
+	Project string `json:"project"`
+	Region  string `json:"region"`
+	Service string `json:"service"`
 }
 
 type rollbackRequest struct {
@@ -141,8 +140,11 @@ func fullServiceName(project, region, service string) string {
 }
 
 // handleFlipTraffic は POST /cloudrun/flip-traffic の handler。
-// body: { project, region, service, to_revision_tag }
-// → Cloud Run service の traffic を to_revision_tag が指す revision に 100% flip。
+// body: { project, region, service }
+// → Cloud Run service の traffic を「最新の ready revision」(= 直前に no-traffic
+// deploy で上がった revision) に 100% flip する。揮発する revision tag には依存
+// しない (Refs ippoan/ci-dashboard#248)。後方互換のため body に残っている
+// to_revision_tag は無視される。
 func handleFlipTraffic(client cloudRunClient) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -158,14 +160,9 @@ func handleFlipTraffic(client cloudRunClient) http.Handler {
 			writeJSONError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		if strings.TrimSpace(req.ToRevisionTag) == "" {
-			writeJSONError(w, http.StatusBadRequest, "to_revision_tag is required")
-			return
-		}
 
 		opName, err := client.FlipTraffic(r.Context(),
-			fullServiceName(req.Project, req.Region, req.Service),
-			req.ToRevisionTag)
+			fullServiceName(req.Project, req.Region, req.Service))
 		if err != nil {
 			log.Printf("flip-traffic upstream error: %v", err)
 			writeJSONError(w, http.StatusBadGateway, "cloud run upstream error")
