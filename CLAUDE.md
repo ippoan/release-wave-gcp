@@ -40,7 +40,7 @@ PR テンプレートは `.github/pull_request_template.md` で `Refs` を強制
   - `roles/run.admin` または、より絞った custom role (= `run.services.update` の minimal set) で **Cloud Run service の traffic 更新のみ**を許可
   - **(将来) `roles/run.viewer`** — `/cloudrun/stage-check` 追加時に
 - write 系のうち以下のみ許可:
-  - **traffic update (`PATCH services?updateMask=traffic`)** — release-wave-handler が `--no-traffic --tag pending-...` で stage 済みの revision に 100% traffic を flip する用途
+  - **traffic update (`PATCH services?updateMask=traffic`)** — `--no-traffic` で stage 済みの **最新 ready revision** に 100% traffic を flip する用途。flip は揮発する revision tag に依存せず `latestReadyRevision` を anchor にする (Refs ippoan/ci-dashboard#248)
   - delete / create / image push / SA 変更 / Cloud Run service 自体の作成削除は **やらない**
 - upstream エラーは proxy が解釈せず status code とともに 502 でラップする。値漏れ防止のため response body は固定文言、詳細は log にだけ出す
 
@@ -154,10 +154,12 @@ RELEASE_WAVE_API_KEY=dev-key ./release-wave-gcp
 curl http://localhost:8080/health
 
 # flip-traffic を叩く (ADC + Cloud Run Admin API への接続が要る、本番 service に注意)
+# flip は service の最新 ready revision (= no-traffic deploy で上がった revision) に
+# 100% 振る。revision tag の指定は不要 (Refs ippoan/ci-dashboard#248)。
 curl -X POST http://localhost:8080/cloudrun/flip-traffic \
   -H 'X-Release-Wave-API-Key: dev-key' \
   -H 'Content-Type: application/json' \
-  -d '{"project":"cloudsql-sv","region":"asia-northeast1","service":"rust-alc-api","to_revision_tag":"pending-v1-42-0"}'
+  -d '{"project":"cloudsql-sv","region":"asia-northeast1","service":"rust-alc-api"}'
 ```
 
 ## テスト方針
