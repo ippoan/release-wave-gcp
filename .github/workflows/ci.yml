@@ -118,5 +118,8 @@ jobs:
       pull-requests: write
     # auto-merge.yml は CI_APP_ID / CI_APP_PRIVATE_KEY (org secret, GitHub App)
     # で installation token を mint する。github.token fallback は撤去された
-    # (ci-workflows#65) ため、secrets: inherit が無いと CI_APP_ID 空で fail する。
-    secrets: inherit
+    # (ci-workflows#65) ため、この 2 secret が無いと CI_APP_ID 空で fail する。
+    # least-privilege: secrets: inherit (全 secret 渡し) でなく必要な 2 つだけ named で渡す。
+    secrets:
+      CI_APP_ID: ${{ secrets.CI_APP_ID }}
+      CI_APP_PRIVATE_KEY: ${{ secrets.CI_APP_PRIVATE_KEY }}
