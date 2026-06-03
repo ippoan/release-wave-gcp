@@ -52,8 +52,46 @@ jobs:
             ghcr.io/ippoan/release-wave-gcp:${{ steps.meta.outputs.tag }}
             ghcr.io/ippoan/release-wave-gcp:latest
 
-  # 全 CI job (= ci / build-image) が success / skipped した時だけ
-  # ci-workflows の auto-merge.yml reusable を呼んで PR auto-merge を enable。
+  # staging deploy: ci-workflows の cloud-run-deploy.yml reusable を呼ぶ。
+  # AR remote-repo `cloudsql-sv/ghcr` (pull-through cache) 経由で digest pin
+  # した image を Cloud Run staging service に流す。
+  #
+  # Auth は WIF (Workload Identity Federation + GitHub OIDC trust)。GCP_SA_KEY
+  # secret は使わない (= runtime / deploy 両側で GCP key 0 個を維持)。
+  #
+  # service は初回のみ手動作成済み (reusable は `gcloud run services update`
+  # = service 既存前提)。以降は本 job が image digest を bump する。
+  # `update_secrets` で `RELEASE_WAVE_API_KEY` を Secret Manager の
+  # `RELEASE_WAVE_GCP_API_KEY`(= ci-dashboard handler が送る GitHub org secret
+  # と同値) に bind する。値は workflow / log を一切経由しない (secretKeyRef)。
+  #
+  # vars (`GCP_WIF_PROVIDER` / `GCP_WIF_SERVICE_ACCOUNT_STAGING`) が空の間は
+  # `if:` で skip され、PR の check は `ci` / `build-image` だけで通る。
+  deploy-staging:
+    name: Deploy (staging)
+    needs: [ci, build-image]
+    if: >-
+      github.event.pull_request.draft != true &&
+      vars.GCP_WIF_PROVIDER != '' &&
+      vars.GCP_WIF_SERVICE_ACCOUNT_STAGING != ''
+    permissions:
+      contents: read
+      id-token: write
+      packages: read
+    uses: ippoan/ci-workflows/.github/workflows/cloud-run-deploy.yml@main
+    with:
+      service: release-wave-gcp-staging
+      region: asia-northeast1
+      project: cloudsql-sv
+      ghcr_image: ghcr.io/ippoan/release-wave-gcp
+      image_tag: ${{ needs.build-image.outputs.image_tag }}
+      ar_repo: asia-northeast1-docker.pkg.dev/cloudsql-sv/ghcr/ippoan/release-wave-gcp
+      workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+      service_account: ${{ vars.GCP_WIF_SERVICE_ACCOUNT_STAGING }}
+      update_secrets: RELEASE_WAVE_API_KEY=RELEASE_WAVE_GCP_API_KEY:latest
+
+  # 全 CI job (= ci / build-image / deploy-staging) が success / skipped した
+  # 時だけ ci-workflows の auto-merge.yml reusable を呼んで PR auto-merge を enable。
   # 内部実装は `gh pr merge --auto --squash` (= GitHub-native auto-merge を queue)。
   #
   # go-ci.yml が内蔵する disable-auto-merge job との対 (= dual-step pattern):
@@ -63,19 +101,17 @@ jobs:
   # `needs:` が success 評価された時点で本 job が動くため、branch protection の
   # required check 設定が空でも、ここに来た時点で「全 CI green が確定」している
   # (= secrets-inventory-gcp#21 のような CI fail 中の誤 merge は起きない)。
-  #
-  # deploy-staging job を後で追加した時は needs: に追加し、if: にも
-  # `needs.deploy-staging.result == 'success' || needs.deploy-staging.result == 'skipped'`
-  # の条件を追加する。
+  # deploy-staging は vars 未設定時 skip されるので `|| skipped` も許容する。
   auto-merge:
     name: Auto Merge
-    needs: [ci, build-image]
+    needs: [ci, build-image, deploy-staging]
     if: >-
       always() &&
       github.event_name == 'pull_request' &&
       github.event.pull_request.draft == false &&
       needs.ci.result == 'success' &&
-      (needs.build-image.result == 'success' || needs.build-image.result == 'skipped')
+      (needs.build-image.result == 'success' || needs.build-image.result == 'skipped') &&
+      (needs.deploy-staging.result == 'success' || needs.deploy-staging.result == 'skipped')
     uses: ippoan/ci-workflows/.github/workflows/auto-merge.yml@main
     permissions:
       contents: write
