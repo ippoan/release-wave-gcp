@@ -52,8 +52,9 @@ func newLiveCloudRun(ctx context.Context, endpoint string) (*liveCloudRun, error
 }
 
 // trafficTarget は v2 API の TrafficTarget JSON 構造。
-// Tag (revision tag による参照) と Revision (full revision name による参照) は
-// 排他で使う。
+// PATCH 送信時 type=REVISION なら Revision (full revision name) が必須。
+// Tag は「その target に tag を付与する」用途 (GET 応答では tag→revision の
+// 対応を読むのに使う)。flip は GET で tag→revision を解決してから Revision で送る。
 type trafficTarget struct {
 	Type     string `json:"type"`
 	Tag      string `json:"tag,omitempty"`
@@ -132,6 +133,16 @@ func (c *liveCloudRun) updateTraffic(ctx context.Context, fullServiceName string
 }
 
 // FlipTraffic は traffic を tag で参照される revision に 100% 振る。
+//
+// Cloud Run v2 の TrafficTarget は type=TRAFFIC_TARGET_ALLOCATION_TYPE_REVISION の
+// とき `revision` (フル revision 名) が必須。`tag` フィールドは「その target に
+// tag を *付与* する」用途で、既存 tag による revision *選択* には使えない
+// (tag だけ指定して type=REVISION にすると Cloud Run が
+// "traffic[0].revision: must be specified if and only if traffic type is
+// TRAFFIC_TARGET_ALLOCATION_TYPE_REVISION" で 400 を返す)。
+// release-wave-handler は `--no-traffic --tag pending-...` で no-traffic revision
+// に tag を付けているので、現 service の traffic[] を GET して tag → revision 名を
+// 解決してから revision 指定で 100% flip する。
 func (c *liveCloudRun) FlipTraffic(ctx context.Context, fullServiceName, toRevisionTag string) (string, error) {
 	if fullServiceName == "" {
 		return "", errors.New("fullServiceName is empty")
@@ -139,11 +150,28 @@ func (c *liveCloudRun) FlipTraffic(ctx context.Context, fullServiceName, toRevis
 	if toRevisionTag == "" {
 		return "", errors.New("toRevisionTag is empty")
 	}
+	svc, err := c.GetService(ctx, fullServiceName)
+	if err != nil {
+		return "", fmt.Errorf("resolve revision tag %q: %w", toRevisionTag, err)
+	}
+	revision := ""
+	for _, t := range svc.Traffic {
+		if t.Tag == toRevisionTag && t.Revision != "" {
+			revision = t.Revision
+			break
+		}
+	}
+	if revision == "" {
+		return "", fmt.Errorf(
+			"revision tag %q not found in service traffic (deploy が --tag %s で no-traffic revision を作っているか確認)",
+			toRevisionTag, toRevisionTag,
+		)
+	}
 	return c.updateTraffic(ctx, fullServiceName, []trafficTarget{
 		{
-			Type:    "TRAFFIC_TARGET_ALLOCATION_TYPE_REVISION",
-			Tag:     toRevisionTag,
-			Percent: 100,
+			Type:     "TRAFFIC_TARGET_ALLOCATION_TYPE_REVISION",
+			Revision: revision,
+			Percent:  100,
 		},
 	})
 }
