@@ -439,7 +439,18 @@ func TestLiveCloudRunFlipTraffic_Success(t *testing.T) {
 		ctype  string
 		body   patchTrafficBody
 	}
+	// FlipTraffic は (1) GET service で tag→revision を解決し (2) PATCH で
+	// 解決した revision に 100% 振る、の 2 段。GCP mock は両方を捌く。
 	gcp := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			// 現 traffic: 100% on old + 0% tagged pending-v1 → revision s-00009-new。
+			_, _ = w.Write([]byte(`{"name":"projects/p/locations/r/services/s",` +
+				`"traffic":[` +
+				`{"type":"TRAFFIC_TARGET_ALLOCATION_TYPE_REVISION","revision":"s-00008-old","percent":100},` +
+				`{"type":"TRAFFIC_TARGET_ALLOCATION_TYPE_REVISION","revision":"s-00009-new","tag":"pending-v1","percent":0}` +
+				`]}`))
+			return
+		}
 		captured.method = r.Method
 		captured.path = r.URL.Path
 		captured.query = r.URL.RawQuery
@@ -479,12 +490,37 @@ func TestLiveCloudRunFlipTraffic_Success(t *testing.T) {
 		t.Fatalf("traffic len: %d", len(captured.body.Traffic))
 	}
 	tt := captured.body.Traffic[0]
-	if tt.Tag != "pending-v1" || tt.Percent != 100 ||
+	// 解決した revision 名で PATCH する (type=REVISION + revision 必須、tag は付けない)。
+	if tt.Revision != "s-00009-new" || tt.Percent != 100 ||
 		tt.Type != "TRAFFIC_TARGET_ALLOCATION_TYPE_REVISION" {
 		t.Fatalf("traffic target: %+v", tt)
 	}
-	if tt.Revision != "" {
-		t.Fatalf("Revision should be empty when flipping by tag: %s", tt.Revision)
+	if tt.Tag != "" {
+		t.Fatalf("Tag should be empty when flipping by resolved revision: %s", tt.Tag)
+	}
+}
+
+// tag が現 traffic に無い (deploy が --tag を付けていない等) と revision を解決
+// できず、PATCH を打たずに loud に fail する。
+func TestLiveCloudRunFlipTraffic_TagNotFound(t *testing.T) {
+	patched := false
+	gcp := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPatch {
+			patched = true
+		}
+		_, _ = w.Write([]byte(`{"name":"projects/p/locations/r/services/s",` +
+			`"traffic":[{"type":"TRAFFIC_TARGET_ALLOCATION_TYPE_REVISION","revision":"s-00008-old","percent":100}]}`))
+	}))
+	defer gcp.Close()
+
+	cr := newTestLiveCloudRun(gcp.URL)
+	_, err := cr.FlipTraffic(context.Background(),
+		"projects/p/locations/r/services/s", "pending-missing")
+	if err == nil || !strings.Contains(err.Error(), "not found") {
+		t.Fatalf("expected tag-not-found error, got: %v", err)
+	}
+	if patched {
+		t.Fatalf("must not PATCH traffic when tag cannot be resolved")
 	}
 }
 
@@ -516,7 +552,27 @@ func TestLiveCloudRunFlipTraffic_EmptyInputs(t *testing.T) {
 	}
 }
 
-func TestLiveCloudRunFlipTraffic_TokenError(t *testing.T) {
+// updateTraffic のエラー分岐 (token / trim / build-request / http-do / parse) は
+// Rollback 経由でカバーする。Rollback は GET を挟まず updateTraffic を直接呼ぶため、
+// PATCH 段のエラーをそのまま exercise できる (FlipTraffic は GET → updateTraffic の
+// 2 段で、GET 段のエラーは GetService の専用テストでカバー済み)。
+
+func TestLiveCloudRunRollback_Non2xx(t *testing.T) {
+	gcp := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"error":{"code":403,"message":"PermissionDenied"}}`))
+	}))
+	defer gcp.Close()
+
+	cr := newTestLiveCloudRun(gcp.URL)
+	_, err := cr.Rollback(context.Background(),
+		"projects/p/locations/r/services/s", "s-00008-old")
+	if err == nil || !strings.Contains(err.Error(), "403") {
+		t.Fatalf("err: %v", err)
+	}
+}
+
+func TestLiveCloudRunRollback_TokenError(t *testing.T) {
 	gcp := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
 	defer gcp.Close()
 	cr := &liveCloudRun{
@@ -524,14 +580,14 @@ func TestLiveCloudRunFlipTraffic_TokenError(t *testing.T) {
 		tokenSrc:   errTokenSource{},
 		endpoint:   gcp.URL,
 	}
-	_, err := cr.FlipTraffic(context.Background(),
-		"projects/p/locations/r/services/s", "tag")
+	_, err := cr.Rollback(context.Background(),
+		"projects/p/locations/r/services/s", "s-00008-old")
 	if err == nil || !strings.Contains(err.Error(), "get token") {
 		t.Fatalf("err: %v", err)
 	}
 }
 
-func TestLiveCloudRunFlipTraffic_LongErrorBodyTrimmed(t *testing.T) {
+func TestLiveCloudRunRollback_LongErrorBodyTrimmed(t *testing.T) {
 	bigBody := strings.Repeat("X", 2048)
 	gcp := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
@@ -540,8 +596,8 @@ func TestLiveCloudRunFlipTraffic_LongErrorBodyTrimmed(t *testing.T) {
 	defer gcp.Close()
 
 	cr := newTestLiveCloudRun(gcp.URL)
-	_, err := cr.FlipTraffic(context.Background(),
-		"projects/p/locations/r/services/s", "tag")
+	_, err := cr.Rollback(context.Background(),
+		"projects/p/locations/r/services/s", "s-00008-old")
 	if err == nil {
 		t.Fatalf("expected error")
 	}
@@ -555,46 +611,46 @@ func TestLiveCloudRunFlipTraffic_LongErrorBodyTrimmed(t *testing.T) {
 	}
 }
 
-func TestLiveCloudRunFlipTraffic_InvalidURL(t *testing.T) {
+func TestLiveCloudRunRollback_InvalidURL(t *testing.T) {
 	cr := &liveCloudRun{
 		httpClient: &http.Client{},
 		tokenSrc:   &staticTokenSource{tok: "t"},
 		endpoint:   "http://control\x7fchar",
 	}
-	_, err := cr.FlipTraffic(context.Background(),
-		"projects/p/locations/r/services/s", "tag")
+	_, err := cr.Rollback(context.Background(),
+		"projects/p/locations/r/services/s", "s-00008-old")
 	if err == nil || !strings.Contains(err.Error(), "build request") {
 		t.Fatalf("err: %v", err)
 	}
 }
 
-func TestLiveCloudRunFlipTraffic_HTTPError(t *testing.T) {
+func TestLiveCloudRunRollback_HTTPError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
 	url := srv.URL
 	srv.Close()
 	cr := newTestLiveCloudRun(url)
-	_, err := cr.FlipTraffic(context.Background(),
-		"projects/p/locations/r/services/s", "tag")
+	_, err := cr.Rollback(context.Background(),
+		"projects/p/locations/r/services/s", "s-00008-old")
 	if err == nil {
 		t.Fatalf("expected error")
 	}
 }
 
-func TestLiveCloudRunFlipTraffic_BadJSONResponse(t *testing.T) {
+func TestLiveCloudRunRollback_BadJSONResponse(t *testing.T) {
 	gcp := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`<not json>`))
 	}))
 	defer gcp.Close()
 
 	cr := newTestLiveCloudRun(gcp.URL)
-	_, err := cr.FlipTraffic(context.Background(),
-		"projects/p/locations/r/services/s", "tag")
+	_, err := cr.Rollback(context.Background(),
+		"projects/p/locations/r/services/s", "s-00008-old")
 	if err == nil {
 		t.Fatalf("expected parse error")
 	}
 }
 
-// --- Rollback ---
+// --- Rollback (happy / inputs) ---
 
 func TestLiveCloudRunRollback_Success(t *testing.T) {
 	var capturedBody patchTrafficBody
