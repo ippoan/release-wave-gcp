@@ -12,7 +12,34 @@ import (
 
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
+
+// grpcCodeFromHTTP は Cloud Run Admin REST の non-2xx status を gRPC code に
+// 逆変換する。handler 側に既配線の cloudrunproxy.StatusFromGRPC が outbound
+// status に戻すための carry (Refs #11)。round-trip が一意な code だけ対応し、
+// それ以外は Unknown (= StatusFromGRPC で従来互換の 502 に倒れる)。
+func grpcCodeFromHTTP(httpStatus int) codes.Code {
+	switch httpStatus {
+	case http.StatusBadRequest:
+		return codes.InvalidArgument
+	case http.StatusUnauthorized:
+		return codes.Unauthenticated
+	case http.StatusForbidden:
+		return codes.PermissionDenied
+	case http.StatusNotFound:
+		return codes.NotFound
+	case http.StatusConflict:
+		return codes.AlreadyExists
+	case http.StatusServiceUnavailable:
+		return codes.Unavailable
+	case http.StatusGatewayTimeout:
+		return codes.DeadlineExceeded
+	default:
+		return codes.Unknown
+	}
+}
 
 // cloudRunClient は Cloud Run Admin v2 への境界。テストでは fake を差し込む。
 //
@@ -125,7 +152,11 @@ func (c *liveCloudRun) updateTraffic(ctx context.Context, fullServiceName string
 		if len(snippet) > 1024 {
 			snippet = snippet[:1024]
 		}
-		return "", fmt.Errorf("cloud run patch returned %d: %s", resp.StatusCode, string(snippet))
+		// status.Errorf で upstream HTTP status を gRPC code として carry する。
+		// メッセージ (snippet 含む) は handler が log にだけ出す — response body
+		// は固定文言のまま (値漏れ防止規約)。
+		return "", status.Errorf(grpcCodeFromHTTP(resp.StatusCode),
+			"cloud run patch returned %d: %s", resp.StatusCode, string(snippet))
 	}
 
 	var lro lroResponse
@@ -227,7 +258,8 @@ func (c *liveCloudRun) GetService(ctx context.Context, fullServiceName string) (
 		if len(snippet) > 1024 {
 			snippet = snippet[:1024]
 		}
-		return nil, fmt.Errorf("cloud run get returned %d: %s", resp.StatusCode, string(snippet))
+		return nil, status.Errorf(grpcCodeFromHTTP(resp.StatusCode),
+			"cloud run get returned %d: %s", resp.StatusCode, string(snippet))
 	}
 
 	// v2 API は JSON で camelCase。本 proxy の output は snake_case に揃える
