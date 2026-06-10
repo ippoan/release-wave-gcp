@@ -11,8 +11,8 @@
 
 [main.go]
 # main()        - HTTP server bootstrap。実行すると ListenAndServe で block するため test 不可。
-# mustEnv()     - log.Fatal を含む env validation。本体はテスト分離した newMuxWith に出してある。
-exclude_funcs = ["main", "mustEnv"]
+# (mustEnv / requireAPIKey / writeJSON* / handleHealth は go-cloudrun-proxy lib に移管済み)
+exclude_funcs = ["main"]
 
 [cloudrun.go]
 # newLiveCloudRun() - google.DefaultTokenSource を呼ぶ ADC 初期化。test 環境では ADC が無いため
