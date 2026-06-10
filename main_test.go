@@ -10,7 +10,10 @@ import (
 	"strings"
 	"testing"
 
+	cloudrunproxy "github.com/ippoan/go-cloudrun-proxy"
 	"golang.org/x/oauth2"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 type fakeCloudRun struct {
@@ -910,5 +913,94 @@ func TestPatchTrafficBodyShape_ByRevision(t *testing.T) {
 	want := `{"traffic":[{"type":"TRAFFIC_TARGET_ALLOCATION_TYPE_REVISION","revision":"r-1","percent":100}]}`
 	if string(buf) != want {
 		t.Fatalf("got=%s want=%s", string(buf), want)
+	}
+}
+
+// ===== upstream HTTP status の gRPC code carry (Refs #11) =====
+
+// TestGrpcCodeFromHTTP は HTTP status → gRPC code の逆変換 table を固定する。
+// StatusFromGRPC (lib 側) と合成すると 403→403 / 404→404 等で round-trip する。
+func TestGrpcCodeFromHTTP(t *testing.T) {
+	cases := []struct {
+		in   int
+		want codes.Code
+	}{
+		{http.StatusBadRequest, codes.InvalidArgument},
+		{http.StatusUnauthorized, codes.Unauthenticated},
+		{http.StatusForbidden, codes.PermissionDenied},
+		{http.StatusNotFound, codes.NotFound},
+		{http.StatusConflict, codes.AlreadyExists},
+		{http.StatusServiceUnavailable, codes.Unavailable},
+		{http.StatusGatewayTimeout, codes.DeadlineExceeded},
+		// 一意に round-trip しない status は Unknown (= 従来互換の 502 に倒れる)
+		{http.StatusInternalServerError, codes.Unknown},
+		{http.StatusTooManyRequests, codes.Unknown},
+		{http.StatusBadGateway, codes.Unknown},
+	}
+	for _, tc := range cases {
+		if got := grpcCodeFromHTTP(tc.in); got != tc.want {
+			t.Fatalf("grpcCodeFromHTTP(%d) = %v, want %v", tc.in, got, tc.want)
+		}
+	}
+}
+
+// upstream が gRPC code を carry した error を返すと、handler は対応する
+// HTTP status で応答する (本 repo の blanket 502 改善の handler 側 round-trip)。
+// body は固定文言のままで詳細を leak しない。
+func TestFlipTraffic_UpstreamGRPCStatusMapped(t *testing.T) {
+	fake := &fakeCloudRun{flipReturnErr: status.Error(codes.PermissionDenied, "iam grant missing")}
+	srv := newTestServer(fake)
+	defer srv.Close()
+	body := `{"project":"p","region":"r","service":"s"}`
+	resp := do(t, srv, http.MethodPost, "/cloudrun/flip-traffic", authHeader(), body)
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status: got %d, want 403", resp.StatusCode)
+	}
+	got := readBody(t, resp)
+	if strings.Contains(got, "iam grant missing") {
+		t.Fatalf("upstream error leaked into response: %s", got)
+	}
+	if !strings.Contains(got, "cloud run upstream error") {
+		t.Fatalf("body should keep the fixed message, got: %s", got)
+	}
+}
+
+// live client の non-2xx は gRPC code を carry し、FlipTraffic の
+// `fmt.Errorf("get service for flip: %w", err)` wrap を越えても
+// StatusFromGRPC が upstream status を復元できる。
+func TestLiveCloudRunFlipTraffic_Non2xxCodeCarriedThroughWrap(t *testing.T) {
+	gcp := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"error":{"code":403,"message":"PermissionDenied"}}`))
+	}))
+	defer gcp.Close()
+
+	cr := newTestLiveCloudRun(gcp.URL)
+	_, err := cr.FlipTraffic(context.Background(),
+		"projects/p/locations/r/services/s")
+	if err == nil {
+		t.Fatalf("expected error")
+	}
+	if got := cloudrunproxy.StatusFromGRPC(err); got != http.StatusForbidden {
+		t.Fatalf("StatusFromGRPC = %d, want 403 (err: %v)", got, err)
+	}
+}
+
+// GetService の non-2xx (404) も code を carry する。
+func TestLiveCloudRunGetService_Non2xxCodeCarried(t *testing.T) {
+	gcp := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"error":{"code":404,"message":"not found"}}`))
+	}))
+	defer gcp.Close()
+
+	cr := newTestLiveCloudRun(gcp.URL)
+	_, err := cr.GetService(context.Background(),
+		"projects/p/locations/r/services/missing")
+	if err == nil {
+		t.Fatalf("expected error")
+	}
+	if got := cloudrunproxy.StatusFromGRPC(err); got != http.StatusNotFound {
+		t.Fatalf("StatusFromGRPC = %d, want 404 (err: %v)", got, err)
 	}
 }
